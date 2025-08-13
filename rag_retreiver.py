@@ -28,9 +28,13 @@ texts = [f"{title} {description}" for description, title in rows]
 
 embeddings=HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
-vector_store=FAISS.from_texts(texts,embeddings)
+faiss_path = "faiss_ticket_index"
 
-vector_store.save_local("faiss_ticket_index")
+if os.path.exists(faiss_path):
+    vector_store = FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
+else:
+    vector_store = FAISS.from_texts(texts, embeddings)
+    vector_store.save_local(faiss_path)
 
 
 retriever = vector_store.as_retriever()
