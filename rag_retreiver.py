@@ -46,8 +46,11 @@ qa_chain=RetreivalQA.from_chain_type(
 )
 
 # 3. Test it
-query = "Show me tickets related to database errors"
-result = qa_chain.invoke({"query": query})
+while True:
+    user_query=input("Ask your Question (or type exit to quit)")
+    if user_query.lower()=="exit":
+        break
 
-print("Answer:", result["result"])
-print("Sources:", result["source_documents"])
+    result = qa_chain.invoke({"query":user_query})
+    print("\nAnswer:", result["result"])
+    print("Sources:", result["source_documents"])        
