@@ -1,68 +1,170 @@
+# file: rag_ticket_ingest_and_query.py
+
+import os
+import psycopg2
+from dotenv import load_dotenv
+from textwrap import shorten
+
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain.chains import RetrievalQA
 from langchain_mistralai import ChatMistralAI
-import psycopg2
-import os
-from dotenv import load_dotenv
+from langchain.chains import RetrievalQA
+from langchain.prompts import PromptTemplate
 
-# 1. Load environment variables
 load_dotenv()
-api_key = os.getenv("MISTRAL_AI_KEY")
 
-# 2. Initialize LLM
-llm = ChatMistralAI(api_key=api_key)
-
-# 3. Connect to Postgres
+# --- DB connection ---
 conn = psycopg2.connect(
     dbname=os.getenv("DB_NAMES"),
     user=os.getenv("DB_USERNAMES"),
     password=os.getenv("DB_PASS"),
     host=os.getenv("DB_HOSTS"),
-    port=os.getenv("DB_PORTS")
+    port=os.getenv("DB_PORTS"),
 )
-cur = conn.cursor()
+conn.autocommit = True
 
-# 4. Fetch tickets
-cur.execute("SELECT id, title, description FROM ticket")
-rows = cur.fetchall()
-
-# Create documents with metadata
-texts = [f"{title} {description}" for (_, title, description) in rows]
-metadatas = [{"id": id, "title": title} for (id, title, _) in rows]
-
-# 5. Build embeddings + vector store
+# --- Models ---
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-faiss_path = "faiss_ticket_index"
+llm = ChatMistralAI(api_key=os.getenv("MISTRAL_AI_KEY"))
 
-if os.path.exists(faiss_path):
-    vector_store = FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
-else:
-    vector_store = FAISS.from_texts(texts, embeddings, metadatas=metadatas)
-    vector_store.save_local(faiss_path)
+# ==============
+# 1) FETCH DATA
+# ==============
+def fetch_ticket_docs_for_org(org_id: int, limit_comments=3):
+    """
+    Returns a list of (text, metadata) tuples for the given org_id.
+    Each item is one Ticket with condensed recent comments.
+    """
+    with conn.cursor() as cur:
+        # Tickets + client/assignee names
+        cur.execute("""
+            SELECT
+                t.id AS ticket_id,
+                t.title,
+                COALESCE(t.description, '') AS description,
+                t.status,
+                t.priority,
+                t.created_at,
+                t.due_date,
+                c.name AS client_name,
+                a.name AS assigned_to_name
+                
+            FROM ticket t
+            LEFT JOIN users c ON c.id = t.client_id
+            LEFT JOIN users a ON a.id = t.assigned_to_id
+           
+            WHERE t.org_id = %s
+            ORDER BY t.id DESC
+        """, (org_id,))
+        tickets = cur.fetchall()
 
-# 6. Create retriever with optional metadata filters
-retriever = vector_store.as_retriever()
+        # Build a map: ticket_id -> recent comments (latest first)
+        cur.execute("""
+            SELECT cm.ticket_id, u.name AS commenter, cm.comment, cm.last_updated
+            FROM comments cm
+            LEFT JOIN users u ON u.id = cm.user_id
+            WHERE cm.ticket_id IN (
+                SELECT id FROM ticket WHERE org_id = %s
+            )
+            ORDER BY cm.last_updated DESC
+        """, (org_id,))
+        comments_rows = cur.fetchall()
 
-qa_chain = RetrievalQA.from_chain_type(
-    llm=llm,
-    retriever=retriever,
-    return_source_documents=True
+    comments_by_ticket = {}
+    for ticket_id, commenter, comment, last_updated in comments_rows:
+        comments_by_ticket.setdefault(ticket_id, [])
+        comments_by_ticket[ticket_id].append(f"{commenter}: {comment}")
+
+    docs = []
+    for (ticket_id, title, description, status, priority, created_at, due_date,
+         client_name, assigned_to_name) in tickets:
+
+        recent_comments = comments_by_ticket.get(ticket_id, [])[:limit_comments]
+        comments_text = " | ".join(recent_comments) if recent_comments else "No recent comments."
+
+        # Keep text concise but informative (helps small-context models)
+        description_snip = shorten(description, width=400, placeholder="...")
+
+        text = (
+            f"Ticket #{ticket_id} ({status}, {priority}) — {title}.\n"
+            f"Description: {description_snip}\n"
+            f"Client: {client_name or 'N/A'} | AssignedTo: {assigned_to_name or 'Unassigned'}\n"
+            f"Recent comments: {comments_text}\n"
+            f"CreatedAt: {created_at} | DueDate: {due_date or 'N/A'}\n"
+            f"Organization ID: {org_id}"
+        )
+
+        metadata = {
+            "ticket_id": ticket_id,
+            "org_id": org_id,
+            "status": status,
+            "priority": str(priority),
+            "assigned_to": assigned_to_name or "",
+            "client": client_name or "",
+            "title": title,
+        }
+
+        docs.append((text, metadata))
+
+    return docs
+
+# =========================
+# 2) BUILD / LOAD INDEXES
+# =========================
+def upsert_faiss_for_org(org_id: int):
+    """
+    Create or update FAISS index for a given org_id from DB.
+    """
+    index_dir = f"indexes/org_{org_id}"
+
+    # Fetch docs
+    docs = fetch_ticket_docs_for_org(org_id)
+    texts = [t for (t, m) in docs]
+    metadatas = [m for (t, m) in docs]
+
+    if os.path.exists(index_dir):
+        # Load and add new docs (simplest approach: rebuild; for prod, track upserts)
+        vs = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
+        vs.add_texts(texts=texts, metadatas=metadatas)
+        vs.save_local(index_dir)
+    else:
+        vs = FAISS.from_texts(texts=texts, embedding=embeddings, metadatas=metadatas)
+        vs.save_local(index_dir)
+
+    return index_dir
+
+# ======================================
+# 3) QUERY (PER ORG) WITH CUSTOM PROMPT
+# ======================================
+PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=(
+        "You are an assistant for a ticketing system. Answer ONLY using the context.\n"
+        "If the context is not relevant, say you don't have info.\n\n"
+        "Context:\n{context}\n\n"
+        "Question: {question}\n"
+        "Answer clearly and concisely."
+    ),
 )
 
-# 7. Test loop
-while True:
-    user_query = input("Ask your Question (or type exit to quit): ")
-    if user_query.lower() == "exit":
-        break
+def ask_for_org(org_id: int, question: str):
+    index_dir = f"indexes/org_{org_id}"
+    if not os.path.exists(index_dir):
+        raise RuntimeError(f"No index for org_id={org_id}. Run upsert_faiss_for_org first.")
 
-    # Example: add metadata filter (e.g. only search in tickets with title "Bug")
-    result = qa_chain.invoke({
-        "query": user_query,
-        "filters": {"title": "Bug"}   # <-- optional filter
-    })
+    vectorstore = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
-    print("\nAnswer:", result["result"])
-    print("Sources:")
-    for doc in result["source_documents"]:
-        print(f"- ID: {doc.metadata.get('id')}, Title: {doc.metadata.get('title')}")
+    qa = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever=retriever,
+        chain_type="stuff",
+        return_source_documents=True,
+        chain_type_kwargs={"prompt": PROMPT},
+    )
+
+    result = qa.invoke({"query": question})
+    return {
+        "answer": result["result"],
+        "sources": [d.page_content[:300] for d in result.get("source_documents", [])]
+    }
