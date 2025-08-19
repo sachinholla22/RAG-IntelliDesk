@@ -11,8 +11,12 @@ from langchain_mistralai import ChatMistralAI
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
 
+from fastapi import FastAPI
+from pydantic import BaseModel
+
 load_dotenv()
 
+app=FastApi()
 # --- DB connection ---
 conn = psycopg2.connect(
     dbname=os.getenv("DB_NAMES"),
@@ -147,13 +151,27 @@ PROMPT = PromptTemplate(
     ),
 )
 
-def ask_for_org(org_id: int, question: str):
+def ask_for_org(org_id: int, question: str, role: str, user_id: int):
     index_dir = f"indexes/org_{org_id}"
     if not os.path.exists(index_dir):
         raise RuntimeError(f"No index for org_id={org_id}. Run upsert_faiss_for_org first.")
 
     vectorstore = FAISS.load_local(index_dir, embeddings, allow_dangerous_deserialization=True)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+    def metadata_filter(metadata):
+        if metadata.get("visibility")=="all":
+            return True
+        if metadata.get("visibility")==role:
+            return True
+        if metadata.get("created_by")==user_id:
+            return True
+        return False    
+            
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"k": 4},
+        search_type="similarity",
+        filter=metadata_filter
+    )
 
     qa = RetrievalQA.from_chain_type(
         llm=llm,
@@ -168,3 +186,15 @@ def ask_for_org(org_id: int, question: str):
         "answer": result["result"],
         "sources": [d.page_content[:300] for d in result.get("source_documents", [])]
     }
+
+class RAGRequest(BaseModel):
+    orgId: int
+    userId: int
+    role: str
+    question: str
+
+
+@app.post("/ask")
+def ask(request:RAGRequest):
+    result = ask_for_org(request.orgId,request.question)
+    return {"answer": result["answer"], "sources":result["sources"]}
