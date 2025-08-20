@@ -196,5 +196,12 @@ class RAGRequest(BaseModel):
 
 @app.post("/ask")
 def ask(request:RAGRequest):
-    result = ask_for_org(request.orgId,request.question)
-    return {"answer": result["answer"], "sources":result["sources"]}
+    result = ask_for_org(request.orgId,request.question,request.userId,request.role)
+
+    return {
+        "success": True,
+        "data": {
+            "answer": result["answer"],
+            "sources": result["sources"]
+        }
+    }   
