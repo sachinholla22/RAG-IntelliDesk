@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 load_dotenv()
 
-app=FastApi()
+app=FastAPI()
 # --- DB connection ---
 conn = psycopg2.connect(
     dbname=os.getenv("DB_NAMES"),
@@ -186,7 +186,7 @@ def ask_for_org(org_id: int, question: str, role: str, user_id: int):
         "answer": result["result"],
         "sources": [d.page_content[:300] for d in result.get("source_documents", [])]
     }
-
+    
 class RAGRequest(BaseModel):
     orgId: int
     userId: int
@@ -199,9 +199,6 @@ def ask(request:RAGRequest):
     result = ask_for_org(request.orgId,request.question,request.userId,request.role)
 
     return {
-        "success": True,
-        "data": {
-            "answer": result["answer"],
-            "sources": result["sources"]
-        }
+       "answer": result["answer"],
+       "sources": result["sources"]
     }   

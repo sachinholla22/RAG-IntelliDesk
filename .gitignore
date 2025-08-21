@@ -1,3 +1,4 @@
 .env
 indexes/
 faiss_ticket_index/
+__pycache__/
