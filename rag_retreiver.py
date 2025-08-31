@@ -150,7 +150,7 @@ PROMPT = PromptTemplate(
         "Answer clearly and concisely."
     ),
 )
-
+upsert_faiss_for_org(5)
 def ask_for_org(org_id: int, question: str, role: str, user_id: int):
     index_dir = f"indexes/org_{org_id}"
     if not os.path.exists(index_dir):
