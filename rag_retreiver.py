@@ -13,6 +13,7 @@ from langchain.prompts import PromptTemplate
 
 from fastapi import FastAPI
 from pydantic import BaseModel
+from confluent_kafka import Consumer
 
 load_dotenv()
 
@@ -26,6 +27,15 @@ conn = psycopg2.connect(
     port=os.getenv("DB_PORTS"),
 )
 conn.autocommit = True
+
+#kafka configs
+conf= {
+    'bootstrap.servers':"kafka:9092",
+    'group.id':"rag-service",
+    'auto-offset.reset':"earliest"
+}
+consumer=Consumer(conf)
+consumer.subscribe(["organization-events"])
 
 # --- Models ---
 embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
@@ -137,6 +147,17 @@ def upsert_faiss_for_org(org_id: int):
 
     return index_dir
 
+while True:
+    msg=consumer.poll(1.0)
+    if msg is None:
+        continue
+    if msg.error():
+        print("Consumer error")
+        continue
+
+    org_id=int(msg.value().decode("utf-8"))
+    print("received org_id",org_id)
+    upsert_faiss_for_org(org_id)        
 # ======================================
 # 3) QUERY (PER ORG) WITH CUSTOM PROMPT
 # ======================================
@@ -150,7 +171,7 @@ PROMPT = PromptTemplate(
         "Answer clearly and concisely."
     ),
 )
-upsert_faiss_for_org(5)
+
 def ask_for_org(org_id: int, question: str, role: str, user_id: int):
     index_dir = f"indexes/org_{org_id}"
     if not os.path.exists(index_dir):
