@@ -14,6 +14,7 @@ from langchain.prompts import PromptTemplate
 from fastapi import FastAPI
 from pydantic import BaseModel
 from confluent_kafka import Consumer
+import asyncio
 
 load_dotenv()
 
@@ -30,9 +31,9 @@ conn.autocommit = True
 
 #kafka configs
 conf= {
-    'bootstrap.servers':"kafka:9092",
+    'bootstrap.servers':"localhost:29092",
     'group.id':"rag-service",
-    'auto-offset.reset':"earliest"
+    'auto.offset.reset':"earliest"
 }
 consumer=Consumer(conf)
 consumer.subscribe(["organization-events"])
@@ -147,17 +148,19 @@ def upsert_faiss_for_org(org_id: int):
 
     return index_dir
 
-while True:
-    msg=consumer.poll(1.0)
-    if msg is None:
-        continue
-    if msg.error():
-        print("Consumer error")
-        continue
+async def consume_messages():
+    while True:
+        msg = consumer.poll(1.0)
+        if msg is not None and not msg.error():
+            org_id = int(msg.value().decode("utf-8"))
+            print("Received org_id", org_id)
+            upsert_faiss_for_org(org_id)
+        await asyncio.sleep(0.1)
 
-    org_id=int(msg.value().decode("utf-8"))
-    print("received org_id",org_id)
-    upsert_faiss_for_org(org_id)        
+@app.on_event("startup")
+async def start_consumer():
+    asyncio.create_task(consume_messages())
+    print("✅ Kafka consumer started in async background")       
 # ======================================
 # 3) QUERY (PER ORG) WITH CUSTOM PROMPT
 # ======================================
